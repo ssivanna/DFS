@@ -1,0 +1,229 @@
+#!/usr/bin/env groovy
+
+library identifier: 'nexus2libraries@master',
+        retriever: modernSCM([$class       : 'GitSCMSource',
+                              credentialsId: 'dci-org-ghapp-m1',
+                              remote       : 'https://github.discoverfinancial.com/scm-org/dsl-nexus2-cert.git',
+                              extensions   : [[
+                                                      $class: 'WipeWorkspace'
+
+                                              ]]])
+
+def nexus2PublicURL = "https://nexus2.discoverfinancial.com/repository/maven-all/"
+def nexus2ReleaseURL = "https://nexus2.discoverfinancial.com/repository/maven-internal-build/"
+
+def groupName = 'com.discover.xpress'
+def artifactName = 'XpressEar'
+def promotionStages = ['TEST', 'RC', 'PROD']
+def dfsVaultUrl = 'https://vaultdev.discoverfinancial.com'
+def vaultRoleID = 'c4982edc-5dfb-7845-f7c4-904b60090fe2'
+def sealightsVaultRoleID = 'f6a80b4f-df6b-4311-00e5-5efa48107d7e'
+def VAULT_NEXUS_SECRET = [
+        [
+                $class: 'VaultSecret', path: 'secret/cicd/nexus/accounts/global', secretValues:
+                [
+                        // Read the secrets into environment variables NEXUS_USERNAME/NEXUS_PASSWORD
+                        [$class: 'VaultSecretValue', envVar: 'NEXUS_USERNAME', vaultKey: 'nexus2username'],
+                        [$class: 'VaultSecretValue', envVar: 'NEXUS_PASSWORD', vaultKey: 'nexus2password'],
+                        [$class: 'VaultSecretValue', envVar: 'NEXUSIQ_USER', vaultKey: 'iquser'],
+                        [$class: 'VaultSecretValue', envVar: 'NEXUSIQ_PASSWORD', vaultKey: 'iqtoken']
+                ]
+        ]
+]
+def VAULT_SEALIGHTS_SECRET = [
+        [
+                $class: 'VaultSecret', path: 'secret/pymtsrv/app/hydra2online/sealights', secretValues:
+                [
+                        // Read the secrets into environment variables SL_TOKEN
+                        [$class: 'VaultSecretValue', envVar: 'SL_TOKEN', vaultKey: 'SL_TOKEN'],
+                        [$class: 'VaultSecretValue', envVar: 'NEXUS_USERNAME', vaultKey: 'nexus2username'],
+                        [$class: 'VaultSecretValue', envVar: 'NEXUS_PASSWORD', vaultKey: 'nexus2password']
+                ]
+        ]
+]
+
+node('cd-subnet') {
+    currentBuild.result = "SUCCESS"
+    def branchName = BRANCH_NAME
+    echo branchName
+    echo Generate_SonarQube_Report
+	echo SonarQube_Selection
+	try {
+        stage('Clean Checkout') {
+            cleanWs()
+            git branch: branchName, credentialsId: 'dci-org-ghapp-m1', poll: false, url: 'https://github.discoverfinancial.com/dci-org/rt-xpress.git'
+        }
+		stage('Install Websphere JDK tool')
+		{
+            installTool(NAME: 'webspherejdk',VERSION:'1.8.0_191')
+		}
+        stage('Build') {
+            Date date = new Date()
+            def timeStamp = date.format("YYYY-MM-dd-HH_mm_ss")
+            println "timeStamp ==> $timeStamp"
+            def javaHome = tool 'was9-jdk8';
+            /*sh """
+            cd $WORKSPACE/XpressEar
+            ./gradlew clean build test ear -PgenerateSources=false -PgenerateJavadoc=false -PnexusPublicRepoURL=${nexus2PublicURL}
+            """*/
+            withVault(vaultSecrets: VAULT_SEALIGHTS_SECRET, roleId: sealightsVaultRoleID, vaultUrl: dfsVaultUrl) {
+                sh """
+                    cd $WORKSPACE/XpressEar
+                    wget -q https://nexus2.discoverfinancial.com/repository/maven-central/io/sealights/on-premise/agents/sl-build-scanner/4.0.2570/sl-build-scanner-4.0.2570.jar
+                    ls -lrt
+                    sed -i "s|SL_TOKEN|${SL_TOKEN}|g" $WORKSPACE/XpressEar/sl-scanConfig.json
+                    sed -i 's/APP_NAME/${artifactName}/' $WORKSPACE/XpressEar/sl-scanConfig.json
+                    sed -i 's|BRANCH_NAME|${branchName}|g' $WORKSPACE/XpressEar/sl-scanConfig.json
+                    sed -i 's/BUILD_NUMBER/${BUILD_NUMBER}/' $WORKSPACE/XpressEar/sl-scanConfig.json
+                    sed -i 's/USERNAME/${NEXUS_USERNAME}/' $WORKSPACE/XpressEar/sl-scanConfig.json
+                    sed -i 's/PASSWORD/${NEXUS_PASSWORD}/' $WORKSPACE/XpressEar/sl-scanConfig.json
+                    set +x
+                    java -jar $WORKSPACE/XpressEar/sl-build-scanner-4.0.2570.jar -gradle -configfile $WORKSPACE/XpressEar/sl-scanConfig.json -workspacepath .
+                    ./gradlew clean build test ear -PgenerateSources=false -PgenerateJavadoc=false -PnexusPublicRepoURL=${nexus2PublicURL}
+                    ./gradlew -x compileJava -x jar -x war -x ear -PgenerateSources=false -PgenerateJavadoc=false -PvaultUrl=${dfsVaultUrl} -ProleId=${vaultRoleID} -PnexusUsername=${NEXUS_USERNAME} -PnexusPassword=${NEXUS_PASSWORD} uploadArchives
+                    java -jar $WORKSPACE/XpressEar/sl-build-scanner-4.0.2570.jar -restoreGradle -workspacepath .
+                """
+
+            }
+            /*withVault(vaultSecrets: VAULT_NEXUS_SECRET, roleId: vaultRoleID, vaultUrl:dfsVaultUrl) {
+                    sh """
+                    cd $WORKSPACE/XpressEar
+                    ./gradlew -x compileJava -x jar -x war -x ear -PgenerateSources=false -PgenerateJavadoc=false -PvaultUrl=${dfsVaultUrl} -ProleId=${vaultRoleID} -PnexusUsername=${NEXUS_USERNAME} -PnexusPassword=${NEXUS_PASSWORD} uploadArchives
+                    """
+            }*/
+
+        }
+        stage('Promote artifact') {
+
+            def version = sh(returnStdout: true, script: "cd $WORKSPACE/XpressEar&&./gradlew properties -q | grep \"version:\" | awk '{print \$2}'").trim()
+
+             println "version is ${version}"
+
+            if(!version.contains('dev'))  {
+                println "its not dev so promoting.."
+
+                for (def promotionStage : promotionStages) {
+                    nexusStagingJava(
+                            GROUP_ID: groupName,
+                            ARTIFACT_ID: artifactName,
+                            ARTIFACT_VERSION: version,
+                            PROMOTION_STAGE: promotionStage
+                    )
+                }
+            }
+
+        }
+         stage('Test & jacocoTestReport') {
+           def javaHome =  tool 'was9-jdk8';
+             java -jar /tmp/sealights/sl-test-listener-4.0.2593.jar  start tokenFile=/tmp/sealights/sltoken.txt labid=SL_XPRESS_LAB_ID  -Dsl.testStage=\"Functional Tests\" -Dsl.proxy=http://proxy-app.discoverfinancial.com:8080 "
+
+             executeScript """#!/bin/sh
+                                           set -x 
+                                           export hydraUser=${hydraUser}
+                                           echo \$hydraUser
+                                           export SEALIGHTS_OPTS="-javaagent:/tmp/sealights/sl-test-listener-4.0.2593.jar -Dsl.tokenFile=/tmp/sealights/sltoken.txt -Dsl.labid=SL_XPRESS_LAB_ID -Dsl.testStage=\"Functional Tests\" -Dsl.proxy=http://proxy-app.discoverfinancial.com:8080 "
+                                            """
+             sh """
+                cd $WORKSPACE/XpressEar
+                ./gradlew test jacocoTestReport -PnexusPublicRepoURL=${nexus2PublicURL}
+             """
+         }
+    		
+		if (Generate_SonarQube_Report == 'Run_On_Branch' || Generate_SonarQube_Report == 'Run_On_Pull_Request') {
+            stage('Install sonarscanner tool') {
+
+                    installTool(NAME: 'sonarscanner', VERSION: '4.7.0.2747')
+
+            }
+	    	stage('SonarQube analysis') {
+                	withSonarQubeEnv('SonarQube2') {
+                        if (Generate_SonarQube_Report == 'Run_On_Branch' )
+                            sh "sonar-scanner -Dsonar.host.url=https://sonarqube.discoverfinancial.com -Dproject.settings=$WORKSPACE/sonar-runner.properties -Dsonar.branch.name=${SonarQube_Selection}"
+                        if (Generate_SonarQube_Report == 'Run_On_Pull_Request')
+                            sh "sonar-scanner -Dsonar.host.url=https://sonarqube.discoverfinancial.com -Dproject.settings=$WORKSPACE/sonar-runner.properties -Dsonar.pullrequest.key=${SonarQube_Selection} -Dsonar.pullrequest.branch=${branchName} -Dsonar.pullrequest.base=develop"
+                    }
+		  }
+
+    	}
+
+         stage('Publish Reports'){
+             println "===> Start : Published Report <==="
+             publishHTML([allowMissing: false, alwaysLinkToLastBuild: true, keepAll: false, reportDir: 'XpressCore/build/reports/tests/test', reportFiles: 'index.html', reportName: 'JaCoCo Code Coverage Report', reportTitles: ''])
+             println "===> End : Published Report <==="
+             junit '**/build/test-results/test/*.xml'
+      }
+	  if (NEXUS_LIFECYCLE_SCAN == 'true'){
+          stage('Nexus IQ Scan'){
+
+              withVault(vaultSecrets: VAULT_NEXUS_SECRET,
+                        roleId: vaultRoleID,
+                        vaultUrl: dfsVaultUrl,
+                        exposeAuthToken:false,
+                        wrap:true) {
+
+                  installTool(NAME: "openjdk", VERSION: "17.0.1")
+                  installTool(NAME: 'nexusiqcli', VERSION: '2.0.0-01')
+                  sh """
+                    java -jar ${NEXUSIQCLI_HOME}/nexus-iq-cli.jar --version
+                    java -jar ${NEXUSIQCLI_HOME}/nexus-iq-cli.jar -s https://nexusiqprod.discoverfinancial.com/ -a ${NEXUSIQ_USER}:${NEXUSIQ_PASSWORD} -t build -i rt-xpress ./*
+                    """
+              }
+            }
+	  }
+     
+	 if (EAR_INSTALL == 'true'){
+		stage('Deploy'){
+        build job: 'rt-xpress-deploy', parameters: [string(name: 'BRANCH_NAME', value: branchName)]
+      }
+	 }
+	 
+	  if (CI_SPRINT == 'true'){
+
+          stage('Reset DB entries') {
+              def vaultSecrets = [
+                      [
+                              $class: 'VaultSecret', path: 'secret/pymtsrv/app/xpress/oracle/dev/app-dci-org-rt-xpress-dev/passwords', secretValues:
+                              [
+                                      [$class: 'VaultSecretValue', envVar: 'ci_xpress_db_password', vaultKey: 'ci_xpress_db_password']
+                              ]
+                      ]
+              ]
+              withVault(
+                      vaultSecrets: vaultSecrets,
+                      roleId: role_id,
+                      vaultUrl: dfsVaultUrl,
+                      exposeAuthToken: false,
+                      wrap: true) {
+                  sh """
+					echo "Write dbPassword to gradle.properties"
+					touch $WORKSPACE/XpressRegressionTest/gradle.properties
+					echo "dbPassword=$ci_xpress_db_password" >> $WORKSPACE/XpressRegressionTest/gradle.properties
+					cd $WORKSPACE/XpressRegressionTest
+					chmod +x gradlew
+					./gradlew clearDownDb insertRecordsInDbCI
+				   """
+              }
+          }
+
+		stage('CI Sprint'){
+			build job: 'rt-xpress-ci-new', parameters: [string(name: 'BRANCH_NAME', value: branchName)]
+		}
+	  }
+	  
+	  if (CI_SPRINT == 'true'){
+		stage('CI Report'){
+			build job: 'rt-xpress-ci-report', parameters: [string(name: 'BRANCH_NAME', value: branchName)]
+		}
+	  }
+    }
+    catch (err) {
+        currentBuild.result = "FAILURE"
+        mail body: "Build Failed: ${env.BUILD_URL}",
+                from: 'jenkinsm1@discover.com',
+                replyTo: 'noreplay@discover.com',
+                subject: 'Build Failed: ${env.BUILD_URL}',
+                to: 'ravindranalwaya@discover.com, sachinkadam@discover.com, tohsifbhura@discover.com'
+        throw err
+    }
+}
+
